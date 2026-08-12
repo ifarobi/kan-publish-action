@@ -1,0 +1,101 @@
+name: "Publish to kan.fyi"
+description: "Publish a directory of static files to your kan.fyi site"
+branding:
+  icon: upload-cloud
+  color: orange
+inputs:
+  token:
+    description: >-
+      kan.fyi access token (Settings → Access tokens). Store it as an
+      encrypted secret: it can publish to every site on the account.
+    required: true
+  site:
+    description: "The eight-character site ID to publish to"
+    required: true
+  dir:
+    description: "Directory of built static files to publish"
+    required: true
+  wait:
+    description: "How long to wait for the publish outcome (Go duration, e.g. 120s)"
+    required: false
+    default: "120s"
+outputs:
+  url:
+    description: >-
+      The live site URL. Empty unless the outcome is live and the site is
+      not private.
+    value: ${{ steps.publish.outputs.url }}
+  outcome:
+    description: >-
+      What became of the publish: live, held, pending, or failed. Set even
+      when the step fails, so a job using continue-on-error can branch on it.
+    value: ${{ steps.publish.outputs.outcome }}
+  exit-code:
+    description: >-
+      The CLI's exit code: 0 live, 1 failed, 2 held, 3 pending.
+    value: ${{ steps.publish.outputs.exit-code }}
+runs:
+  using: composite
+  steps:
+    - name: Download kan
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="$(cat "${GITHUB_ACTION_PATH}/VERSION")"
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)    BIN="kan-linux-amd64" ;;
+          Linux-ARM64)  BIN="kan-linux-arm64" ;;
+          macOS-X64)    BIN="kan-darwin-amd64" ;;
+          macOS-ARM64)  BIN="kan-darwin-arm64" ;;
+          Windows-X64)  BIN="kan-windows-amd64.exe" ;;
+          *) echo "unsupported runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        BASE="https://github.com/ifarobi/kan-publish-action/releases/download/${VERSION}"
+        curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${BIN}" "${BASE}/${BIN}"
+        curl -fsSL --retry 3 -o "${RUNNER_TEMP}/checksums.txt" "${BASE}/checksums.txt"
+        # macOS runners ship no sha256sum (only shasum), and macOS is two of
+        # the five cases above — without the fallback the action died there on
+        # a missing tool rather than anything to do with publishing.
+        if command -v sha256sum >/dev/null 2>&1; then
+          (cd "${RUNNER_TEMP}" && grep "  ${BIN}\$" checksums.txt | sha256sum -c -)
+        else
+          (cd "${RUNNER_TEMP}" && grep "  ${BIN}\$" checksums.txt | shasum -a 256 -c -)
+        fi
+        chmod +x "${RUNNER_TEMP}/${BIN}"
+        echo "KAN_BIN=${RUNNER_TEMP}/${BIN}" >> "${GITHUB_ENV}"
+    - name: Publish
+      id: publish
+      shell: bash
+      # Inputs travel as env vars, never inline ${{ }} inside the script:
+      # inline interpolation of user-controlled values enables script
+      # injection, and secrets on a command line show up in `ps`.
+      env:
+        KANFYI_TOKEN: ${{ inputs.token }}
+        KANFYI_SITE: ${{ inputs.site }}
+        KAN_DIR: ${{ inputs.dir }}
+        KAN_WAIT: ${{ inputs.wait }}
+      run: |
+        set -uo pipefail
+        # Deliberately not `set -e`, and the exit code is captured rather than
+        # inherited: the CLI grades its answer 0 live / 1 failed / 2 held /
+        # 3 pending, and letting the shell abort here collapsed all three
+        # nonzero states into one red step. A first publish from a new account
+        # is ALWAYS held for review, so the common case looked like a broken
+        # deploy and invited the republish the README forbids. The step still
+        # fails on every nonzero code, but writes the outputs first, so a
+        # workflow using continue-on-error can read steps.<id>.outputs.outcome
+        # and tell "under review" from "rejected".
+        url="$("${KAN_BIN}" publish "${KAN_DIR}" --wait "${KAN_WAIT}")"
+        code=$?
+        case "${code}" in
+          0) outcome="live" ;;
+          2) outcome="held" ;;
+          3) outcome="pending" ;;
+          *) outcome="failed" ;;
+        esac
+        {
+          echo "url=${url}"
+          echo "outcome=${outcome}"
+          echo "exit-code=${code}"
+        } >> "${GITHUB_OUTPUT}"
+        exit "${code}"
